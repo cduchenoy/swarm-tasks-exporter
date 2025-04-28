@@ -80,9 +80,9 @@ func listenSwarmEvents(ctx context.Context, cli *client.Client) error {
 	filterArgs.Add("type", "service")
 	filterArgs.Add("type", "node")
 
-	evtCh, errCh := cli.Events(ctx, types.EventsOptions{
-		Since:   time.Now().Format(time.RFC3339),
-		Filters: filterArgs,
+	evtCh, errCh := cli.Events(ctx, events.ListOptions{
+    	Since:   time.Now().Format(time.RFC3339),
+    	Filters: filterArgs,
 	})
 
 	logrus.Info("Start listening for new Swarm events...")

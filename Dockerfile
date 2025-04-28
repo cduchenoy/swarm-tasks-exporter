@@ -1,20 +1,24 @@
-FROM golang:1.10-alpine as builder
+# syntax = docker/dockerfile:1
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 
-ENV SRC_DIR ${GOPATH}/src/NiR-/swarm-tasks-exporter/
+ARG TARGETOS TARGETARCH
 
-RUN apk add --no-cache ca-certificates git
+WORKDIR /go/src
 
-COPY . ${SRC_DIR}
-WORKDIR ${SRC_DIR}
+COPY go.mod go.sum ./
+RUN go mod download
 
-RUN go get -d -v
+COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /go/bin/swarm-tasks-exporter
+RUN	--mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg \
+	GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -ldflags="-extldflags '-static'" -o /usr/local/bin/swarm-tasks-exporter 
 
-###############################################################################
+FROM alpine:3.22
 
-FROM scratch
+COPY --from=builder /usr/local/bin/swarm-tasks-exporter /usr/local/bin/swarm-tasks-exporter
 
-COPY --from=builder /go/bin/swarm-tasks-exporter /go/bin/swarm-tasks-exporter
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD wget -qO- http://localhost:8888/metrics || exit 1
 
-ENTRYPOINT ["/go/bin/swarm-tasks-exporter"]
+ENTRYPOINT ["/usr/local/bin/swarm-tasks-exporter"]
