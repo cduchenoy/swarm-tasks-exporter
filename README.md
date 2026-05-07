@@ -3,6 +3,10 @@
 This little Prometheus exporter provides metrics to better monitor Swarm
 tasks and their state.
 
+> **Fork** - This is a fork of [akerouanton/swarm-tasks-exporter](https://github.com/akerouanton/swarm-tasks-exporter)
+> with additional metrics and bug fixes. Available on Docker Hub:
+> [`gecoit84/swarm-tasks-exporter`](https://hub.docker.com/r/gecoit84/swarm-tasks-exporter/)
+
 ## Summary
 
 * [How it works](#how-it-works)
@@ -52,10 +56,10 @@ The completion-based rule (`running == 0` and `complete >= effective_desired →
 
 ## Install
 
-This exporter is available on Docker Hub: [`akerouanton/swarm-tasks-exporter`](https://hub.docker.com/r/akerouanton/swarm-tasks-exporter/):
+This fork is available on Docker Hub: [`gecoit84/swarm-tasks-exporter`](https://hub.docker.com/r/gecoit84/swarm-tasks-exporter/)
 
 ```sh
-docker run -v /var/run/docker.sock:/var/run/docker.sock:ro akerouanton/swarm-tasks-exporter
+docker run -v /var/run/docker.sock:/var/run/docker.sock:ro gecoit84/swarm-tasks-exporter
 ```
 
 Or, with Docker Swarm:
@@ -63,7 +67,7 @@ Or, with Docker Swarm:
 ```yaml
 services:
   tasks_exporter:
-    image: akerouanton/swarm-tasks-exporter:latest
+    image: gecoit84/swarm-tasks-exporter:latest
     command: -log-level error
     volumes:
       - '/var/run/docker.sock:/var/run/docker.sock:ro'
@@ -120,7 +124,7 @@ services:
 # exporter service
 services:
   tasks_exporter:
-    image: akerouanton/swarm-tasks-exporter:latest
+    image: gecoit84/swarm-tasks-exporter:latest
     command: -label environment -label team
     volumes:
       - '/var/run/docker.sock:/var/run/docker.sock:ro'
