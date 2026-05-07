@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -54,6 +55,16 @@ func initDesiredReplicasGauge(ctx context.Context, cli *client.Client) error {
 }
 
 func updateServiceReplicasGauge(svc swarm.Service, metadata serviceMetadata) {
+	// io.prometheus.desired label overrides the Docker-reported count.
+	// Useful for global services with placement constraints where Docker
+	// reports all nodes but only a subset matches the constraint.
+	if override, ok := svc.Spec.Annotations.Labels["io.prometheus.desired"]; ok {
+		if val, err := strconv.ParseFloat(override, 64); err == nil && val >= 0 {
+			setDesiredReplicasGauge(metadata, val)
+			return
+		}
+	}
+
 	if svc.Spec.Mode.Replicated != nil {
 		setDesiredReplicasGauge(metadata, float64(*svc.Spec.Mode.Replicated.Replicas))
 	} else {
