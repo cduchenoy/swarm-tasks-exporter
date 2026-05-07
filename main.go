@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/docker/api/types/swarm"
@@ -26,6 +27,7 @@ type serviceMetadata struct {
 }
 
 var (
+	metaMu        sync.RWMutex
 	metadataCache = make(map[string]serviceMetadata)
 )
 
@@ -50,11 +52,16 @@ func buildMetadata(svc swarm.Service) serviceMetadata {
 }
 
 func serviceMode(svc swarm.Service) string {
-	if svc.Spec.Mode.Replicated != nil {
+	switch {
+	case svc.Spec.Mode.Replicated != nil:
 		return "replicated"
+	case svc.Spec.Mode.ReplicatedJob != nil:
+		return "replicated-job"
+	case svc.Spec.Mode.GlobalJob != nil:
+		return "global-job"
+	default:
+		return "global"
 	}
-
-	return "global"
 }
 
 func sanitizeLabelNames(orig []string) []string {
@@ -151,7 +158,9 @@ func main() {
 
 	configureLogger()
 	configureDesiredReplicasGauge()
+	configureEffectiveDesiredGauge()
 	configureReplicasStateGauge()
+	configureHealthGauge()
 
 	ctx := context.Background()
 
@@ -184,6 +193,7 @@ func main() {
 			}
 
 			updateReplicasStateGauge(polled)
+			updateHealthGauge(polled)
 			time.Sleep(*pollDelay)
 		}
 	}()

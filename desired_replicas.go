@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/docker/docker/api/types"
@@ -15,9 +17,19 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+type effectiveCacheEntry struct {
+	val    float64
+	labels prometheus.Labels // sanitized, ready for gauge
+}
+
 var (
-	desiredReplicasGauge *prometheus.GaugeVec
-	nodeCount            = 0
+	desiredReplicasGauge  *prometheus.GaugeVec
+	effectiveDesiredGauge *prometheus.GaugeVec
+
+	effectiveMu           sync.RWMutex
+	effectiveDesiredCache = make(map[string]effectiveCacheEntry)
+
+	nodeCount atomic.Int64
 )
 
 func configureDesiredReplicasGauge() {
@@ -34,6 +46,20 @@ func configureDesiredReplicasGauge() {
 	prometheus.MustRegister(desiredReplicasGauge)
 }
 
+func configureEffectiveDesiredGauge() {
+	labels := append([]string{
+		"stack",
+		"service",
+		"service_mode",
+	}, customLabels...)
+
+	effectiveDesiredGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "swarm_service_effective_desired_replicas",
+		Help: "Effective desired replicas after io.prometheus.desired label override",
+	}, sanitizeLabelNames(labels))
+	prometheus.MustRegister(effectiveDesiredGauge)
+}
+
 func initDesiredReplicasGauge(ctx context.Context, cli *client.Client) error {
 	services, err := cli.ServiceList(ctx, types.ServiceListOptions{})
 	if err != nil {
@@ -44,11 +70,19 @@ func initDesiredReplicasGauge(ctx context.Context, cli *client.Client) error {
 	if err != nil {
 		return err
 	}
-	nodeCount = len(nodes)
+	nodeCount.Store(int64(len(nodes)))
 
+	metaMu.Lock()
 	for _, svc := range services {
 		metadataCache[svc.ID] = buildMetadata(svc)
-		updateServiceReplicasGauge(svc, metadataCache[svc.ID])
+	}
+	metaMu.Unlock()
+
+	for _, svc := range services {
+		metaMu.RLock()
+		md := metadataCache[svc.ID]
+		metaMu.RUnlock()
+		updateServiceReplicasGauge(svc, md)
 	}
 
 	return nil
@@ -61,15 +95,40 @@ func updateServiceReplicasGauge(svc swarm.Service, metadata serviceMetadata) {
 	if override, ok := svc.Spec.Annotations.Labels["io.prometheus.desired"]; ok {
 		if val, err := strconv.ParseFloat(override, 64); err == nil && val >= 0 {
 			setDesiredReplicasGauge(metadata, val)
+			setEffective(metadata, val)
 			return
 		}
 	}
 
-	if svc.Spec.Mode.Replicated != nil {
-		setDesiredReplicasGauge(metadata, float64(*svc.Spec.Mode.Replicated.Replicas))
-	} else {
-		setDesiredReplicasGauge(metadata, float64(nodeCount))
+	var effective float64
+	switch {
+	case svc.Spec.Mode.Replicated != nil:
+		effective = float64(*svc.Spec.Mode.Replicated.Replicas)
+	case svc.Spec.Mode.ReplicatedJob != nil && svc.Spec.Mode.ReplicatedJob.TotalCompletions != nil:
+		effective = float64(*svc.Spec.Mode.ReplicatedJob.TotalCompletions)
+	default: // global and global-job: one task per node
+		effective = float64(nodeCount.Load())
 	}
+	setDesiredReplicasGauge(metadata, effective)
+	setEffective(metadata, effective)
+}
+
+func setEffective(metadata serviceMetadata, val float64) {
+	labels := prometheus.Labels{
+		"stack":        metadata.stack,
+		"service":      metadata.service,
+		"service_mode": metadata.serviceMode,
+	}
+	for k, v := range metadata.customLabels {
+		labels[k] = v
+	}
+	effectiveMu.Lock()
+	effectiveDesiredCache[metadata.service] = effectiveCacheEntry{
+		val:    val,
+		labels: sanitizeMetricLabels(labels),
+	}
+	effectiveMu.Unlock()
+	setEffectiveDesiredGauge(metadata, val)
 }
 
 func setDesiredReplicasGauge(metadata serviceMetadata, val float64) {
@@ -78,12 +137,22 @@ func setDesiredReplicasGauge(metadata serviceMetadata, val float64) {
 		"service":      metadata.service,
 		"service_mode": metadata.serviceMode,
 	}
-
 	for k, v := range metadata.customLabels {
 		labels[k] = v
 	}
-
 	desiredReplicasGauge.With(sanitizeMetricLabels(labels)).Set(val)
+}
+
+func setEffectiveDesiredGauge(metadata serviceMetadata, val float64) {
+	labels := prometheus.Labels{
+		"stack":        metadata.stack,
+		"service":      metadata.service,
+		"service_mode": metadata.serviceMode,
+	}
+	for k, v := range metadata.customLabels {
+		labels[k] = v
+	}
+	effectiveDesiredGauge.With(sanitizeMetricLabels(labels)).Set(val)
 }
 
 func listenSwarmEvents(ctx context.Context, cli *client.Client) error {
@@ -92,8 +161,8 @@ func listenSwarmEvents(ctx context.Context, cli *client.Client) error {
 	filterArgs.Add("type", "node")
 
 	evtCh, errCh := cli.Events(ctx, events.ListOptions{
-    	Since:   time.Now().Format(time.RFC3339),
-    	Filters: filterArgs,
+		Since:   time.Now().Format(time.RFC3339),
+		Filters: filterArgs,
 	})
 
 	logrus.Info("Start listening for new Swarm events...")
@@ -127,29 +196,34 @@ func processEvent(ctx context.Context, cli *client.Client, evt events.Message) e
 		// Re-init desired replicas gauge when a node is added/deleted,
 		// to be sure global services have the right number of desired replicas
 		if evt.Action == "create" {
-			nodeCount = nodeCount + 1
+			nodeCount.Add(1)
 			initDesiredReplicasGauge(ctx, cli)
 		} else if evt.Action == "remove" {
-			nodeCount = nodeCount - 1
+			nodeCount.Add(-1)
 			initDesiredReplicasGauge(ctx, cli)
 		}
-
 		return nil
 	}
 
 	sid := evt.Actor.ID
 
 	if evt.Action == "remove" {
+		metaMu.RLock()
 		metadata, ok := metadataCache[sid]
+		metaMu.RUnlock()
 		if !ok {
 			return errors.New("no cached metadata found for removed service")
 		}
 
-		// @TODO: at this point, the vector should be deleted (?)
-		setDesiredReplicasGauge(metadata, float64(0))
+		setDesiredReplicasGauge(metadata, 0)
 
-		// Clean up labels cache as this won't be used anymore
+		metaMu.Lock()
 		delete(metadataCache, sid)
+		metaMu.Unlock()
+
+		effectiveMu.Lock()
+		delete(effectiveDesiredCache, metadata.service)
+		effectiveMu.Unlock()
 
 		return nil
 	}
@@ -159,8 +233,12 @@ func processEvent(ctx context.Context, cli *client.Client, evt events.Message) e
 		return err
 	}
 
-	metadataCache[sid] = buildMetadata(svc)
-	updateServiceReplicasGauge(svc, metadataCache[sid])
+	md := buildMetadata(svc)
+	metaMu.Lock()
+	metadataCache[sid] = md
+	metaMu.Unlock()
+
+	updateServiceReplicasGauge(svc, md)
 
 	return nil
 }

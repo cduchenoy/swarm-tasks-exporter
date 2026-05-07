@@ -111,25 +111,33 @@ func pollReplicasState(ctx context.Context, cli *client.Client) (serviceCounter,
 func getServiceLabels(ctx context.Context, cli *client.Client, task swarm.Task) (prometheus.Labels, error) {
 	sid := task.ServiceID
 
-	if _, ok := metadataCache[sid]; !ok {
+	metaMu.RLock()
+	_, ok := metadataCache[sid]
+	metaMu.RUnlock()
+
+	if !ok {
 		svc, _, err := cli.ServiceInspectWithRaw(ctx, sid, types.ServiceInspectOptions{})
 		if err != nil {
 			return map[string]string{}, err
 		}
-
-		metadataCache[sid] = buildMetadata(svc)
+		md := buildMetadata(svc)
+		metaMu.Lock()
+		metadataCache[sid] = md
+		metaMu.Unlock()
 	}
+
+	metaMu.RLock()
+	md := metadataCache[sid]
+	metaMu.RUnlock()
 
 	labels := prometheus.Labels{
-		"stack":        metadataCache[sid].stack,
-		"service":      metadataCache[sid].service,
-		"service_mode": metadataCache[sid].serviceMode,
+		"stack":        md.stack,
+		"service":      md.service,
+		"service_mode": md.serviceMode,
 	}
-
-	for k, v := range metadataCache[sid].customLabels {
+	for k, v := range md.customLabels {
 		labels[k] = v
 	}
-
 	return labels, nil
 }
 
